@@ -202,6 +202,27 @@ def flash_mla_sched_meta_kernel(
             tl.store(meta + 7, 0)
 
 @triton.jit
+def _load_kv_tail_to_smem(
+    Kv,
+    dst_tail,
+    kv_row,
+    stride_kv_token,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    D_CHUNK: tl.constexpr,
+):
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, D_CHUNK)
+    rows = tl.broadcast_to(offs_n[:, None], (BLOCK_N, D_CHUNK))
+    cols = tl.broadcast_to(offs_d[None, :], (BLOCK_N, D_CHUNK))
+    vals = tle.load(
+        Kv + (kv_row + rows) * stride_kv_token + HEAD_DIM_V + cols,
+        is_async=True,
+    )
+    tl.store(tle.gpu.local_ptr(dst_tail, (rows, cols)), vals)
+
+
+@triton.jit
 def _flash_mla_ws_kv_producer(
     k0_l_writer,
     k0_r_writer,
@@ -209,7 +230,6 @@ def _flash_mla_ws_kv_producer(
     k1_r_writer,
     Kv,
     Kv_desc,
-    Kv_tail_desc,
     Block_table,
     B_seq_len,
     begin_req_idx,
@@ -257,7 +277,15 @@ def _flash_mla_ws_kv_producer(
             k0_r_slot = k0_r_writer.acquire(pipe_idx)
             tle.gpu.copy(Kv_desc, k0_r_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row0, HEAD_DIM_V // 2])
             if HAVE_TAIL:
-                tle.gpu.copy(Kv_tail_desc, k0_r_slot.sK_tail, [BLOCK_N, D_CHUNK], [kv_row0, HEAD_DIM_V])
+                _load_kv_tail_to_smem(
+                    Kv,
+                    k0_r_slot.sK_tail,
+                    kv_row0,
+                    stride_kv_token,
+                    BLOCK_N,
+                    HEAD_DIM_V,
+                    D_CHUNK,
+                )
             k0_r_writer.commit(pipe_idx)
 
             k1_l_slot = k1_l_writer.acquire(k1_pipe_idx)
@@ -267,7 +295,15 @@ def _flash_mla_ws_kv_producer(
             k1_r_slot = k1_r_writer.acquire(k1_pipe_idx)
             tle.gpu.copy(Kv_desc, k1_r_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row1, HEAD_DIM_V // 2])
             if HAVE_TAIL:
-                tle.gpu.copy(Kv_tail_desc, k1_r_slot.sK_tail, [BLOCK_N, D_CHUNK], [kv_row1, HEAD_DIM_V])
+                _load_kv_tail_to_smem(
+                    Kv,
+                    k1_r_slot.sK_tail,
+                    kv_row1,
+                    stride_kv_token,
+                    BLOCK_N,
+                    HEAD_DIM_V,
+                    D_CHUNK,
+                )
             k1_r_writer.commit(k1_pipe_idx)
 
         if has_tail:
@@ -283,7 +319,15 @@ def _flash_mla_ws_kv_producer(
             k0_r_slot = k0_r_writer.acquire(pipe_idx)
             tle.gpu.copy(Kv_desc, k0_r_slot.sK, [BLOCK_N, HEAD_DIM_V // 2], [kv_row0, HEAD_DIM_V // 2])
             if HAVE_TAIL:
-                tle.gpu.copy(Kv_tail_desc, k0_r_slot.sK_tail, [BLOCK_N, D_CHUNK], [kv_row0, HEAD_DIM_V])
+                _load_kv_tail_to_smem(
+                    Kv,
+                    k0_r_slot.sK_tail,
+                    kv_row0,
+                    stride_kv_token,
+                    BLOCK_N,
+                    HEAD_DIM_V,
+                    D_CHUNK,
+                )
             k0_r_writer.commit(pipe_idx)
 
         pipe_base += n_pair_slots
@@ -304,10 +348,9 @@ def _flash_mla_ws_consumer0(
     q_writer,
     q_reader,
     sO_stage,
+    Q,
     Q_desc,
-    Q_tail_desc,
     Output_desc,
-    OAccum_desc,
     O,
     O_accum,
     LSE_accum,
@@ -331,6 +374,7 @@ def _flash_mla_ws_consumer0(
     stride_lseaccum_h,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     D_CHUNK: tl.constexpr,
     HAVE_TAIL: tl.constexpr,
@@ -371,7 +415,23 @@ def _flash_mla_ws_consumer0(
         tle.gpu.copy(Q_desc, q_write_slot.sQ_l, [BLOCK_M, HALF_DIM_V], [q_row, 0])
         tle.gpu.copy(Q_desc, q_write_slot.sQ_r, [BLOCK_M, HALF_DIM_V], [q_row, HALF_DIM_V])
         if HAVE_TAIL:
-            tle.gpu.copy(Q_tail_desc, q_write_slot.sQ_tail, [BLOCK_M, D_CHUNK], [q_row, HEAD_DIM_V])
+            q_tail_cols = tl.arange(0, D_CHUNK)
+            q_tail_rows = tl.broadcast_to(offs_h[:, None], (BLOCK_M, D_CHUNK))
+            q_tail_cols_b = tl.broadcast_to(q_tail_cols[None, :], (BLOCK_M, D_CHUNK))
+            q_tail_vals = tle.load(
+                Q
+                + (q_row + q_tail_rows) * HEAD_DIM
+                + HEAD_DIM_V
+                + q_tail_cols_b,
+                mask=mask_h[:, None],
+                other=0.0,
+                is_async=True,
+            )
+            tl.store(
+                tle.gpu.local_ptr(q_write_slot.sQ_tail, (q_tail_rows, q_tail_cols_b)),
+                q_tail_vals,
+                mask=mask_h[:, None],
+            )
         q_writer.commit(q_stage)
 
         q_wait = q_reader.wait(q_stage)
@@ -519,8 +579,21 @@ def _flash_mla_ws_consumer0(
             out_vals = tl.where(valid[:, None], out_vals, 0.0)
             out_vals_q = out_vals.to(O.dtype.element_ty)
             tl.store(tle.gpu.local_ptr(q_slot.sQ_l), out_vals_q, mask=mask_h[:, None])
-            oaccum_row = split_idx * head_num + head_base
-            tle.gpu.copy(q_slot.sQ_l, OAccum_desc, [BLOCK_M, HALF_DIM_V], [oaccum_row, 0])
+            rows_m = tl.broadcast_to(offs_h[:, None], (BLOCK_M, HALF_DIM_V))
+            cols_l = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_M, HALF_DIM_V))
+            vals_from_smem_l = tl.load(
+                tle.gpu.local_ptr(q_slot.sQ_l, (rows_m, cols_l)),
+                mask=mask_h[:, None],
+                other=0.0,
+            )
+            tl.store(
+                O_accum
+                + split_idx * stride_oaccum_split
+                + head_offsets[:, None] * stride_oaccum_h
+                + cols_l,
+                vals_from_smem_l,
+                mask=mask_h[:, None],
+            )
 
         q_reader.release(q_stage)
         pipe_base += n_pair_slots
@@ -540,9 +613,7 @@ def _flash_mla_ws_consumer1(
     q_reader,
     sO_stage,
     Q_desc,
-    Q_tail_desc,
     Output_desc,
-    OAccum_desc,
     O,
     O_accum,
     LSE_accum,
@@ -571,7 +642,6 @@ def _flash_mla_ws_consumer1(
     HAVE_TAIL: tl.constexpr,
 ):
     unused_q_desc = Q_desc
-    unused_q_tail_desc = Q_tail_desc
     offs_h = tl.arange(0, BLOCK_M)
     head_offsets = head_base + offs_h
     HALF_DIM_V: tl.constexpr = HEAD_DIM_V // 2
@@ -717,8 +787,22 @@ def _flash_mla_ws_consumer1(
             out_vals = tl.where(valid[:, None], out_vals, 0.0)
             out_vals_q = out_vals.to(O.dtype.element_ty)
             tl.store(tle.gpu.local_ptr(q_slot.sQ_r), out_vals_q, mask=mask_h[:, None])
-            oaccum_row = split_idx * head_num + head_base
-            tle.gpu.copy(q_slot.sQ_r, OAccum_desc, [BLOCK_M, HALF_DIM_V], [oaccum_row, HALF_DIM_V])
+            rows_m = tl.broadcast_to(offs_h[:, None], (BLOCK_M, HALF_DIM_V))
+            cols_smem = tl.broadcast_to(tl.arange(0, HALF_DIM_V)[None, :], (BLOCK_M, HALF_DIM_V))
+            cols_r = HALF_DIM_V + cols_smem
+            vals_from_smem_r = tl.load(
+                tle.gpu.local_ptr(q_slot.sQ_r, (rows_m, cols_smem)),
+                mask=mask_h[:, None],
+                other=0.0,
+            )
+            tl.store(
+                O_accum
+                + split_idx * stride_oaccum_split
+                + head_offsets[:, None] * stride_oaccum_h
+                + cols_r,
+                vals_from_smem_r,
+                mask=mask_h[:, None],
+            )
             tl.store(LSE_accum + split_idx * stride_lseaccum_split + head_offsets * stride_lseaccum_h,
                 lse_vals, mask=mask_h)
         q_reader.release(q_stage)
@@ -729,11 +813,9 @@ def _flash_mla_ws_consumer1(
 @triton.jit
 def flash_mla_splitkv_ws_tle_kernel(
     Q_desc,
-    Q_tail_desc,
     Output_desc,
-    OAccum_desc,
     Kv_desc,
-    Kv_tail_desc,
+    Q,
     Kv,
     Block_table,
     B_seq_len,
@@ -950,10 +1032,9 @@ def flash_mla_splitkv_ws_tle_kernel(
                     q_pipe.writer(),
                     q_pipe.reader("wg0"),
                     sK0_l,
+                    Q,
                     Q_desc,
-                    Q_tail_desc,
                     Output_desc,
-                    OAccum_desc,
                     O,
                     O_accum,
                     LSE_accum,
@@ -977,6 +1058,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                     stride_lseaccum_h,
                     BLOCK_M,
                     BLOCK_N,
+                    HEAD_DIM,
                     HEAD_DIM_V,
                     D_CHUNK,
                     HAVE_TAIL,
@@ -997,9 +1079,7 @@ def flash_mla_splitkv_ws_tle_kernel(
                     q_pipe.reader("wg1"),
                     sK1_r,
                     Q_desc,
-                    Q_tail_desc,
                     Output_desc,
-                    OAccum_desc,
                     O,
                     O_accum,
                     LSE_accum,
@@ -1037,7 +1117,6 @@ def flash_mla_splitkv_ws_tle_kernel(
                     k1_r_pipe.writer(),
                     Kv,
                     Kv_desc,
-                    Kv_tail_desc,
                     Block_table,
                     B_seq_len,
                     begin_req_idx,
@@ -1198,7 +1277,6 @@ def _try_flash_mla_tle(
         (total_num_splits, h_q), dtype=torch.float32, device=q.device
     )
     out_flat = out.view(b * s_q * h_q, dv)
-    out_accum_flat = out_accum.view(total_num_splits * h_q, dv)
     d_chunk = 64
     q_desc = TensorDescriptor(
         q_flat,
@@ -1206,21 +1284,9 @@ def _try_flash_mla_tle(
         strides=[d, 1],
         block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
     )
-    q_tail_desc = TensorDescriptor(
-        q_flat,
-        shape=[b * s_q * h_q, d],
-        strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, d_chunk],
-    )
     output_desc = TensorDescriptor(
         out_flat,
         shape=[b * s_q * h_q, dv],
-        strides=[dv, 1],
-        block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
-    )
-    oaccum_desc = TensorDescriptor(
-        out_accum_flat,
-        shape=[total_num_splits * h_q, dv],
         strides=[dv, 1],
         block_shape=[FLASH_MLA_BLOCK_M, dv // 2],
     )
@@ -1230,20 +1296,12 @@ def _try_flash_mla_tle(
         strides=[d, 1],
         block_shape=[FLASH_MLA_BLOCK_N, dv // 2],
     )
-    kv_tail_desc = TensorDescriptor(
-        kv_flat,
-        shape=[kv_flat.shape[0], d],
-        strides=[d, 1],
-        block_shape=[FLASH_MLA_BLOCK_N, d_chunk],
-    )
 
     flash_mla_splitkv_ws_tle_kernel[(num_m_blocks, num_sm_parts)](
         q_desc,
-        q_tail_desc,
         output_desc,
-        oaccum_desc,
         kv_desc,
-        kv_tail_desc,
+        q_flat,
         kv_flat,
         block_table_tle,
         cache_seqlens_tle,
